@@ -1,22 +1,17 @@
-# GitCode Vision
+﻿# GitHub Project Analyzer
 
-中文 | [English](#english)
+涓枃 | [English](#english)
 
-## 中文
+## 涓枃
 
-GitCode Vision 是一个 GitHub 仓库代码分析与可视化工具。输入仓库地址后，应用会拉取项目结构，调用 AI 生成项目分析结果，并展示函数调用全景图与可导出的 Markdown 分析文档。
+GitHub Project Analyzer 鏄竴涓?GitHub 浠撳簱浠ｇ爜鍒嗘瀽涓庡彲瑙嗗寲宸ュ叿銆傝緭鍏ヤ粨搴撳湴鍧€鍚庯紝搴旂敤浼氭媺鍙栭」鐩粨鏋勶紝璋冪敤 AI 鐢熸垚椤圭洰鍒嗘瀽缁撴灉锛屽苟灞曠ず鍑芥暟璋冪敤鍏ㄦ櫙鍥句笌鍙鍑虹殑 Markdown 鍒嗘瀽鏂囨。銆?
+### 鍔熻兘鐗规€?
+- GitHub 浠撳簱缁撴瀯鎷夊彇涓庢枃浠舵爲娴忚
+- AI 鍒嗘瀽锛氫富瑕佽瑷€銆佹妧鏈爤銆佸€欓€夊叆鍙ｆ枃浠?- 鍏ュ彛鏂囦欢鐮斿垽涓庡嚱鏁拌皟鐢ㄩ摼涓嬮捇
+- 鍔熻兘妯″潡鑱氱被锛堝彲鎸夋ā鍧楃瓫閫夛級
+- 鍙鍖栬皟鐢ㄥ叧绯诲浘锛坄@xyflow/react`锛?- 鍒嗘瀽鍘嗗彶鏈湴鎸佷箙鍖栵紙`localStorage`锛?- 鍒嗘瀽缁撴灉瀵煎嚭涓?`.md`
 
-### 功能特性
-
-- GitHub 仓库结构拉取与文件树浏览
-- AI 分析：主要语言、技术栈、候选入口文件
-- 入口文件研判与函数调用链下钻
-- 功能模块聚类（可按模块筛选）
-- 可视化调用关系图（`@xyflow/react`）
-- 分析历史本地持久化（`localStorage`）
-- 分析结果导出为 `.md`
-
-### 技术栈
+### 鎶€鏈爤
 
 - React 19 + TypeScript + Vite
 - Tailwind CSS 4
@@ -24,20 +19,18 @@ GitCode Vision 是一个 GitHub 仓库代码分析与可视化工具。输入仓
 - React Flow (`@xyflow/react`)
 - `react-syntax-highlighter`
 
-### 环境要求
+### 鐜瑕佹眰
 
-- Node.js 18+（建议 LTS）
-- npm 9+
+- Node.js 18+锛堝缓璁?LTS锛?- npm 9+
 
-### 快速开始
-
-1. 安装依赖
+### 蹇€熷紑濮?
+1. 瀹夎渚濊禆
 
 ```bash
 npm install
 ```
 
-2. 在项目根目录创建 `.env`（参考下面模板）
+2. 鍦ㄩ」鐩牴鐩綍鍒涘缓 `.env`锛堝弬鑰冧笅闈㈡ā鏉匡級
 
 ```env
 BASE_URL=https://your-llm-api-base-url
@@ -48,62 +41,50 @@ MAX_DRILL_DOWN_DEPTH=2
 APP_URL=http://localhost:3000
 ```
 
-3. 启动开发环境
-
+3. 鍚姩寮€鍙戠幆澧?
 ```bash
 npm run dev
 ```
 
-4. 打开浏览器访问 `http://localhost:3000`
+4. 鎵撳紑娴忚鍣ㄨ闂?`http://localhost:3000`
 
-### 环境变量说明
+### 鐜鍙橀噺璇存槑
 
-- `BASE_URL`：LLM API 基础地址（代码中会请求 `${BASE_URL}/chat/completions`）
-- `API_KEY`：LLM API 密钥
-- `MODEL`：模型名
-- `GITHUB_TOKEN`：可选，提升 GitHub API 访问配额
-- `MAX_DRILL_DOWN_DEPTH`：函数调用链最大下钻层级，默认 `2`
-- `APP_URL`：项目中预留变量（当前前端逻辑未直接使用）
+- `BASE_URL`锛歀LM API 鍩虹鍦板潃锛堜唬鐮佷腑浼氳姹?`${BASE_URL}/chat/completions`锛?- `API_KEY`锛歀LM API 瀵嗛挜
+- `MODEL`锛氭ā鍨嬪悕
+- `GITHUB_TOKEN`锛氬彲閫夛紝鎻愬崌 GitHub API 璁块棶閰嶉
+- `MAX_DRILL_DOWN_DEPTH`锛氬嚱鏁拌皟鐢ㄩ摼鏈€澶т笅閽诲眰绾э紝榛樿 `2`
+- `APP_URL`锛氶」鐩腑棰勭暀鍙橀噺锛堝綋鍓嶅墠绔€昏緫鏈洿鎺ヤ娇鐢級
 
-### 可用脚本
+### 鍙敤鑴氭湰
 
-- `npm run dev`：开发模式（端口 `3000`）
-- `npm run build`：生产构建
-- `npm run preview`：预览构建产物
-- `npm run lint`：TypeScript 类型检查
-
-### 项目结构
+- `npm run dev`锛氬紑鍙戞ā寮忥紙绔彛 `3000`锛?- `npm run build`锛氱敓浜ф瀯寤?- `npm run preview`锛氶瑙堟瀯寤轰骇鐗?- `npm run lint`锛歍ypeScript 绫诲瀷妫€鏌?
+### 椤圭洰缁撴瀯
 
 ```text
 src/
   components/
-    PanoramaPanel.tsx      # 函数调用全景图
-  lib/
-    analysisHistory.ts     # 分析历史与 Markdown 生成
+    PanoramaPanel.tsx      # 鍑芥暟璋冪敤鍏ㄦ櫙鍥?  lib/
+    analysisHistory.ts     # 鍒嗘瀽鍘嗗彶涓?Markdown 鐢熸垚
   pages/
-    Home.tsx               # 仓库地址输入与历史列表
-    Analyze.tsx            # 分析主流程与页面
+    Home.tsx               # 浠撳簱鍦板潃杈撳叆涓庡巻鍙插垪琛?    Analyze.tsx            # 鍒嗘瀽涓绘祦绋嬩笌椤甸潰
 ```
 
-### 使用流程
+### 浣跨敤娴佺▼
 
-1. 在首页输入 GitHub 仓库 URL（如 `https://github.com/owner/repo`）
-2. 进入分析页，自动拉取仓库信息与文件树
-3. AI 输出语言/技术栈/入口文件，并继续生成函数调用链与模块划分
-4. 在右侧查看调用图，点击节点可定位源码
-5. 导出 Markdown 分析文件
+1. 鍦ㄩ椤佃緭鍏?GitHub 浠撳簱 URL锛堝 `https://github.com/owner/repo`锛?2. 杩涘叆鍒嗘瀽椤碉紝鑷姩鎷夊彇浠撳簱淇℃伅涓庢枃浠舵爲
+3. AI 杈撳嚭璇█/鎶€鏈爤/鍏ュ彛鏂囦欢锛屽苟缁х画鐢熸垚鍑芥暟璋冪敤閾句笌妯″潡鍒掑垎
+4. 鍦ㄥ彸渚ф煡鐪嬭皟鐢ㄥ浘锛岀偣鍑昏妭鐐瑰彲瀹氫綅婧愮爜
+5. 瀵煎嚭 Markdown 鍒嗘瀽鏂囦欢
 
-### 注意事项
+### 娉ㄦ剰浜嬮」
 
-- 当前主要面向公开仓库；私有仓库需确保 token 权限和跨域策略都正确。
-- `.env*` 已被 `.gitignore` 忽略，不要提交真实密钥。
-- 前端会直接请求你配置的 LLM 接口，请确认接口兼容 `chat/completions`。
-
+- 褰撳墠涓昏闈㈠悜鍏紑浠撳簱锛涚鏈変粨搴撻渶纭繚 token 鏉冮檺鍜岃法鍩熺瓥鐣ラ兘姝ｇ‘銆?- `.env*` 宸茶 `.gitignore` 蹇界暐锛屼笉瑕佹彁浜ょ湡瀹炲瘑閽ャ€?- 鍓嶇浼氱洿鎺ヨ姹備綘閰嶇疆鐨?LLM 鎺ュ彛锛岃纭鎺ュ彛鍏煎 `chat/completions`銆?
 ---
 
 ## English
 
-GitCode Vision is a GitHub repository analysis and visualization tool. After you provide a repo URL, it fetches project structure, calls an AI endpoint for analysis, visualizes function call chains, and lets you export a Markdown report.
+GitHub Project Analyzer is a GitHub repository analysis and visualization tool. After you provide a repo URL, it fetches project structure, calls an AI endpoint for analysis, visualizes function call chains, and lets you export a Markdown report.
 
 ### Features
 
@@ -197,3 +178,4 @@ src/
 - Public repositories are the primary target flow.
 - Keep `.env` secrets out of version control.
 - Ensure your configured LLM endpoint is compatible with `chat/completions` style requests.
+
