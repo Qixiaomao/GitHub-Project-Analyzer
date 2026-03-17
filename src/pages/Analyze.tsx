@@ -46,6 +46,7 @@ interface SubFunction {
   shouldDrillDown: number;
   possibleFile: string;
   description: string;
+  url?: string;
   depth?: number;
   moduleId?: string;
   moduleName?: string;
@@ -65,6 +66,29 @@ interface AIAnalysisResult {
   mainLanguages: string[];
   techStack: string[];
   entryFiles: string[];
+}
+
+interface BridgeContext {
+  entryFilePath: string;
+  entryFileContent: string;
+  flatTree: any[];
+  mainLanguages: string[];
+  techStack: string[];
+  getFileContent: (path: string) => Promise<string | null>;
+}
+
+interface BridgeResult {
+  strategyId: string;
+  strategyName: string;
+  reason: string;
+  subFunctions: SubFunction[];
+}
+
+interface FrameworkBridgeStrategy {
+  id: string;
+  name: string;
+  canBridge: (context: BridgeContext) => boolean;
+  buildBridgeSubFunctions: (context: BridgeContext) => Promise<SubFunction[]>;
 }
 
 interface LogEntry {
@@ -705,6 +729,403 @@ const normalizeFunctionName = (name: string) => {
   return plain;
 };
 
+const hasValueInText = (items: string[], keyword: string) =>
+  items.some((item) => item.toLowerCase().includes(keyword.toLowerCase()));
+
+const extractAnnotationStringPaths = (annotationArgs: string): string[] => {
+  const quoted = Array.from(annotationArgs.matchAll(/"([^"]+)"/g))
+    .map((match) => match[1])
+    .filter(Boolean);
+  return quoted.length > 0 ? quoted : ['/'];
+};
+
+const normalizeUrlPath = (path: string) => {
+  const normalized = path.trim();
+  if (!normalized) {
+    return '/';
+  }
+  if (normalized.startsWith('http://') || normalized.startsWith('https://')) {
+    return normalized;
+  }
+  return normalized.startsWith('/') ? normalized : `/${normalized}`;
+};
+
+const joinUrlPath = (prefix: string, path: string) => {
+  const left = normalizeUrlPath(prefix);
+  const right = normalizeUrlPath(path);
+  const leftTrim = left === '/' ? '' : left.replace(/\/+$/, '');
+  const rightTrim = right === '/' ? '' : right.replace(/^\/+/, '');
+  const joined = `${leftTrim}/${rightTrim}`.replace(/\/{2,}/g, '/');
+  return joined || '/';
+};
+
+const extractQuotedStringValues = (input: string): string[] => {
+  const values: string[] = [];
+  const regex = /['"]([^'"]+)['"]/g;
+  let match: RegExpExecArray | null = regex.exec(input);
+  while (match) {
+    values.push(match[1]);
+    match = regex.exec(input);
+  }
+  return values;
+};
+
+const parseSpringControllerMappings = (content: string) => {
+  if (!/@(RestController|Controller)\b/.test(content)) {
+    return { className: '', endpoints: [] as Array<{ methodName: string; url: string; verb: string }> };
+  }
+
+  const classNameMatch = content.match(/\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b/);
+  const className = classNameMatch?.[1] || 'UnknownController';
+  let classPath = '/';
+
+  const classBlockMatch = content.match(
+    /((?:@\w+(?:\([^)]*\))?\s*)+)\s*(?:public\s+)?class\s+[A-Za-z_][A-Za-z0-9_]*/m,
+  );
+  if (classBlockMatch?.[1]) {
+    const requestMappingMatch = classBlockMatch[1].match(/@RequestMapping\s*\(([\s\S]*?)\)/m);
+    if (requestMappingMatch?.[1]) {
+      const paths = extractAnnotationStringPaths(requestMappingMatch[1]);
+      classPath = normalizeUrlPath(paths[0] || '/');
+    }
+  }
+
+  const endpoints: Array<{ methodName: string; url: string; verb: string }> = [];
+  const methodBlockRegex =
+    /((?:@\w+(?:\([^)]*\))?\s*)+)\s*(?:public|protected|private)?\s*(?:static\s+)?[\w<>\[\],.?]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*\{/gm;
+
+  let methodMatch: RegExpExecArray | null = methodBlockRegex.exec(content);
+  while (methodMatch) {
+    const annotationBlock = methodMatch[1] || '';
+    const methodName = methodMatch[2] || '';
+    const mappingMatch = annotationBlock.match(
+      /@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping)\s*(?:\(([\s\S]*?)\))?/m,
+    );
+    if (mappingMatch) {
+      const mappingType = mappingMatch[1];
+      const args = mappingMatch[2] || '';
+      const paths = extractAnnotationStringPaths(args);
+      const verbByType: Record<string, string> = {
+        GetMapping: 'GET',
+        PostMapping: 'POST',
+        PutMapping: 'PUT',
+        DeleteMapping: 'DELETE',
+        PatchMapping: 'PATCH',
+        RequestMapping: 'ANY',
+      };
+      const verb = verbByType[mappingType] || 'ANY';
+      paths.forEach((path) => {
+        endpoints.push({
+          methodName,
+          url: joinUrlPath(classPath, path),
+          verb,
+        });
+      });
+    }
+    methodMatch = methodBlockRegex.exec(content);
+  }
+
+  return { className, endpoints };
+};
+
+const springBootBridgeStrategy: FrameworkBridgeStrategy = {
+  id: 'java-springboot-controller-bridge',
+  name: 'Spring Boot Controller Bridge',
+  canBridge: (context) => {
+    const hasJava = hasValueInText(context.mainLanguages, 'java');
+    const hasSpringTech = context.techStack.some((stack) => /spring\s*boot|spring/i.test(stack));
+    const entryLooksSpring = /@SpringBootApplication\b|SpringApplication\.run\s*\(/.test(context.entryFileContent);
+    const hasSpringProjectFiles = context.flatTree.some(
+      (item) =>
+        item.type === 'blob' &&
+        (item.path.endsWith('pom.xml') || item.path.endsWith('build.gradle') || item.path.endsWith('build.gradle.kts')),
+    );
+    return (hasJava || hasSpringTech) && (entryLooksSpring || hasSpringProjectFiles);
+  },
+  buildBridgeSubFunctions: async (context) => {
+    const javaFiles = context.flatTree.filter((item) => item.type === 'blob' && item.path.endsWith('.java'));
+    const prioritized = javaFiles
+      .filter((item) => /controller/i.test(item.path))
+      .concat(javaFiles.filter((item) => !/controller/i.test(item.path)))
+      .slice(0, 160);
+
+    const controllerSubs: SubFunction[] = [];
+    for (const item of prioritized) {
+      const content = await context.getFileContent(item.path);
+      if (!content || !/@(RestController|Controller)\b/.test(content)) {
+        continue;
+      }
+
+      const parsed = parseSpringControllerMappings(content);
+      if (parsed.endpoints.length === 0) {
+        continue;
+      }
+
+      parsed.endpoints.forEach((endpoint) => {
+        controllerSubs.push({
+          name: `${parsed.className}.${endpoint.methodName}`,
+          shouldDrillDown: 1,
+          possibleFile: item.path,
+          description: `Spring Controller endpoint (${endpoint.verb})`,
+          url: endpoint.url,
+        });
+      });
+    }
+
+    const uniqueBySignature = new Map<string, SubFunction>();
+    controllerSubs.forEach((sub) => {
+      const key = `${sub.name}|${sub.possibleFile}|${sub.url || ''}`;
+      if (!uniqueBySignature.has(key)) {
+        uniqueBySignature.set(key, sub);
+      }
+    });
+
+    return Array.from(uniqueBySignature.values()).slice(0, 80);
+  },
+};
+
+const parseFlaskRoutes = (content: string) => {
+  const endpoints: Array<{ functionName: string; url: string; verb: string }> = [];
+  const decoratorRegex =
+    /@(?:[A-Za-z_][A-Za-z0-9_]*)\.(route|get|post|put|delete|patch|options|head)\s*\(([\s\S]*?)\)\s*\n\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/gm;
+
+  let match: RegExpExecArray | null = decoratorRegex.exec(content);
+  while (match) {
+    const decorator = match[1].toLowerCase();
+    const args = match[2] || '';
+    const functionName = match[3] || '';
+    const paths = extractQuotedStringValues(args);
+    const routePath = paths[0] || '/';
+
+    if (decorator === 'route') {
+      const methodsMatch = args.match(/methods\s*=\s*\[([^\]]+)\]/i);
+      const methods = methodsMatch ? extractQuotedStringValues(methodsMatch[1]).map((m) => m.toUpperCase()) : ['ANY'];
+      methods.forEach((verb) => {
+        endpoints.push({ functionName, url: normalizeUrlPath(routePath), verb });
+      });
+    } else {
+      endpoints.push({ functionName, url: normalizeUrlPath(routePath), verb: decorator.toUpperCase() });
+    }
+
+    match = decoratorRegex.exec(content);
+  }
+
+  return endpoints;
+};
+
+const parseFastAPIRoutes = (content: string) => {
+  const routerPrefixMap = new Map<string, string>();
+  const routerDeclRegex = /([A-Za-z_][A-Za-z0-9_]*)\s*=\s*APIRouter\s*\(([\s\S]*?)\)/gm;
+  let routerDeclMatch: RegExpExecArray | null = routerDeclRegex.exec(content);
+  while (routerDeclMatch) {
+    const routerName = routerDeclMatch[1];
+    const args = routerDeclMatch[2] || '';
+    const prefixMatch = args.match(/prefix\s*=\s*['"]([^'"]+)['"]/i);
+    routerPrefixMap.set(routerName, prefixMatch?.[1] || '/');
+    routerDeclMatch = routerDeclRegex.exec(content);
+  }
+
+  const endpoints: Array<{ functionName: string; url: string; verb: string }> = [];
+  const decoratorRegex =
+    /@([A-Za-z_][A-Za-z0-9_]*)\.(get|post|put|delete|patch|options|head)\s*\(([\s\S]*?)\)\s*\n\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/gm;
+
+  let match: RegExpExecArray | null = decoratorRegex.exec(content);
+  while (match) {
+    const routerName = match[1];
+    const verb = match[2].toUpperCase();
+    const args = match[3] || '';
+    const functionName = match[4] || '';
+    const path = extractQuotedStringValues(args)[0] || '/';
+    const prefix = routerPrefixMap.get(routerName) || '/';
+
+    endpoints.push({
+      functionName,
+      verb,
+      url: joinUrlPath(prefix, path),
+    });
+    match = decoratorRegex.exec(content);
+  }
+
+  return endpoints;
+};
+
+const parseDjangoUrls = (content: string) => {
+  const routes: Array<{ functionName: string; url: string; possibleFile: string }> = [];
+  const pathRegex =
+    /\b(?:path|re_path)\s*\(\s*(['"])(.*?)\1\s*,\s*([A-Za-z_][A-Za-z0-9_\.]*(?:\.as_view\(\))?)/gm;
+
+  let match: RegExpExecArray | null = pathRegex.exec(content);
+  while (match) {
+    const rawPath = match[2] || '';
+    const targetExpr = match[3] || '';
+    if (/\.include\s*$/.test(targetExpr) || /^include\b/.test(targetExpr)) {
+      match = pathRegex.exec(content);
+      continue;
+    }
+
+    let functionName = targetExpr;
+    if (targetExpr.endsWith('.as_view()')) {
+      const className = targetExpr.replace(/\.as_view\(\)$/, '').split('.').pop() || 'UnknownView';
+      functionName = `${className}.as_view`;
+    } else if (targetExpr.includes('.')) {
+      functionName = targetExpr.split('.').pop() || targetExpr;
+    }
+
+    routes.push({
+      functionName,
+      url: normalizeUrlPath(rawPath),
+      possibleFile: targetExpr,
+    });
+
+    match = pathRegex.exec(content);
+  }
+
+  return routes;
+};
+
+const isPythonProject = (context: BridgeContext) =>
+  hasValueInText(context.mainLanguages, 'python') || context.flatTree.some((item) => item.type === 'blob' && item.path.endsWith('.py'));
+
+const flaskBridgeStrategy: FrameworkBridgeStrategy = {
+  id: 'python-flask-route-bridge',
+  name: 'Flask Route Bridge',
+  canBridge: (context) => {
+    if (!isPythonProject(context)) return false;
+    const hasFlaskTech = context.techStack.some((stack) => /flask/i.test(stack));
+    const entryLooksFlask = /from\s+flask\s+import\b|Flask\s*\(/.test(context.entryFileContent);
+    return hasFlaskTech || entryLooksFlask;
+  },
+  buildBridgeSubFunctions: async (context) => {
+    const pyFiles = context.flatTree
+      .filter((item) => item.type === 'blob' && item.path.endsWith('.py'))
+      .sort((a, b) => {
+        const aScore = /(app|main|routes|views|api)\.py$/i.test(a.path) ? 0 : 1;
+        const bScore = /(app|main|routes|views|api)\.py$/i.test(b.path) ? 0 : 1;
+        return aScore - bScore;
+      })
+      .slice(0, 180);
+
+    const subs: SubFunction[] = [];
+    for (const item of pyFiles) {
+      const content = await context.getFileContent(item.path);
+      if (!content || !/@[A-Za-z_][A-Za-z0-9_]*\.(route|get|post|put|delete|patch|options|head)\s*\(/.test(content)) {
+        continue;
+      }
+
+      parseFlaskRoutes(content).forEach((endpoint) => {
+        subs.push({
+          name: endpoint.functionName,
+          shouldDrillDown: 1,
+          possibleFile: item.path,
+          description: `Flask route handler (${endpoint.verb})`,
+          url: endpoint.url,
+        });
+      });
+    }
+
+    const unique = new Map<string, SubFunction>();
+    subs.forEach((sub) => unique.set(`${sub.name}|${sub.possibleFile}|${sub.url || ''}`, sub));
+    return Array.from(unique.values()).slice(0, 100);
+  },
+};
+
+const fastApiBridgeStrategy: FrameworkBridgeStrategy = {
+  id: 'python-fastapi-route-bridge',
+  name: 'FastAPI Route Bridge',
+  canBridge: (context) => {
+    if (!isPythonProject(context)) return false;
+    const hasFastApiTech = context.techStack.some((stack) => /fastapi/i.test(stack));
+    const entryLooksFastApi = /from\s+fastapi\s+import\b|FastAPI\s*\(/.test(context.entryFileContent);
+    return hasFastApiTech || entryLooksFastApi;
+  },
+  buildBridgeSubFunctions: async (context) => {
+    const pyFiles = context.flatTree
+      .filter((item) => item.type === 'blob' && item.path.endsWith('.py'))
+      .sort((a, b) => {
+        const aScore = /(main|app|api|router|routes|views)\.py$/i.test(a.path) ? 0 : 1;
+        const bScore = /(main|app|api|router|routes|views)\.py$/i.test(b.path) ? 0 : 1;
+        return aScore - bScore;
+      })
+      .slice(0, 220);
+
+    const subs: SubFunction[] = [];
+    for (const item of pyFiles) {
+      const content = await context.getFileContent(item.path);
+      if (!content || !/@[A-Za-z_][A-Za-z0-9_]*\.(get|post|put|delete|patch|options|head)\s*\(/.test(content)) {
+        continue;
+      }
+
+      parseFastAPIRoutes(content).forEach((endpoint) => {
+        subs.push({
+          name: endpoint.functionName,
+          shouldDrillDown: 1,
+          possibleFile: item.path,
+          description: `FastAPI route handler (${endpoint.verb})`,
+          url: endpoint.url,
+        });
+      });
+    }
+
+    const unique = new Map<string, SubFunction>();
+    subs.forEach((sub) => unique.set(`${sub.name}|${sub.possibleFile}|${sub.url || ''}`, sub));
+    return Array.from(unique.values()).slice(0, 120);
+  },
+};
+
+const djangoBridgeStrategy: FrameworkBridgeStrategy = {
+  id: 'python-django-route-bridge',
+  name: 'Django Route Bridge',
+  canBridge: (context) => {
+    if (!isPythonProject(context)) return false;
+    const hasDjangoTech = context.techStack.some((stack) => /django/i.test(stack));
+    const hasManagePy = context.flatTree.some((item) => item.type === 'blob' && item.path.endsWith('manage.py'));
+    const hasUrlsPy = context.flatTree.some((item) => item.type === 'blob' && /urls\.py$/i.test(item.path));
+    return hasDjangoTech || hasManagePy || hasUrlsPy;
+  },
+  buildBridgeSubFunctions: async (context) => {
+    const urlFiles = context.flatTree
+      .filter((item) => item.type === 'blob' && /urls\.py$/i.test(item.path))
+      .slice(0, 120);
+
+    const subs: SubFunction[] = [];
+    for (const item of urlFiles) {
+      const content = await context.getFileContent(item.path);
+      if (!content || !/\burlpatterns\b/.test(content)) {
+        continue;
+      }
+
+      const baseDir = item.path.includes('/') ? item.path.substring(0, item.path.lastIndexOf('/')) : '';
+      parseDjangoUrls(content).forEach((route) => {
+        let possibleFile = item.path;
+        if (route.possibleFile.startsWith('views.')) {
+          possibleFile = baseDir ? `${baseDir}/views.py` : 'views.py';
+        } else if (route.possibleFile.includes('.')) {
+          possibleFile = `${route.possibleFile.replace(/\.as_view\(\)$/, '').split('.').slice(0, -1).join('/')}.py`;
+        }
+
+        subs.push({
+          name: route.functionName,
+          shouldDrillDown: 1,
+          possibleFile,
+          description: 'Django route handler',
+          url: route.url,
+        });
+      });
+    }
+
+    const unique = new Map<string, SubFunction>();
+    subs.forEach((sub) => unique.set(`${sub.name}|${sub.possibleFile}|${sub.url || ''}`, sub));
+    return Array.from(unique.values()).slice(0, 120);
+  },
+};
+
+const FRAMEWORK_BRIDGE_STRATEGIES: FrameworkBridgeStrategy[] = [
+  springBootBridgeStrategy,
+  fastApiBridgeStrategy,
+  flaskBridgeStrategy,
+  djangoBridgeStrategy,
+];
+
 const findFunctionLine = (code: string, functionName: string) => {
   const lines = code.split('\n');
   const escaped = functionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -1073,7 +1494,7 @@ export default function Analyze() {
         addLog('AI 分析完成', 'success', { response: result });
         
         // 触发入口文件研判
-        evaluateEntryFiles(result.entryFiles, result.mainLanguages, description, flatTree, branch);
+        evaluateEntryFiles(result.entryFiles, result.mainLanguages, result.techStack, description, flatTree, branch);
       } catch (parseErr: any) {
         console.error("JSON Parse Error:", parseErr);
         throw parseErr;
@@ -1088,7 +1509,14 @@ export default function Analyze() {
     }
   };
 
-  const evaluateEntryFiles = async (entryFiles: string[], mainLanguages: string[], description: string, flatTree: any[], branch: string) => {
+  const evaluateEntryFiles = async (
+    entryFiles: string[],
+    mainLanguages: string[],
+    techStack: string[],
+    description: string,
+    flatTree: any[],
+    branch: string
+  ) => {
     if (!entryFiles || entryFiles.length === 0) return;
     setEvaluatingEntry(true);
     setWorkflowStatus('evaluating_entry');
@@ -1160,7 +1588,7 @@ ${contentToSend}
             addLog(`已确认项目真实入口文件: ${filePath}`, 'success');
             
             // 触发子函数分析
-            await analyzeSubFunctions(filePath, contentToSend, description, flatTree);
+            await analyzeSubFunctions(filePath, contentToSend, description, flatTree, mainLanguages, techStack);
             break; // Stop evaluating further files
           }
         } catch (parseErr: any) {
@@ -1192,6 +1620,28 @@ ${contentToSend}
     }
   };
 
+  const tryResolveBridgeSubFunctions = async (context: BridgeContext): Promise<BridgeResult | null> => {
+    for (const strategy of FRAMEWORK_BRIDGE_STRATEGIES) {
+      if (!strategy.canBridge(context)) {
+        continue;
+      }
+
+      addLog(`检测到可用桥接策略: ${strategy.name}`, 'info');
+      const subFunctions = await strategy.buildBridgeSubFunctions(context);
+      if (subFunctions.length > 0) {
+        return {
+          strategyId: strategy.id,
+          strategyName: strategy.name,
+          reason: 'Framework-managed invocation path',
+          subFunctions,
+        };
+      }
+
+      addLog(`桥接策略 ${strategy.name} 未提取到可分析节点，回退常规入口分析`, 'info');
+    }
+    return null;
+  };
+
   /**
    * 检查函数是否为库函数（系统库或第三方库）
    * 如果是库函数，返回 true，否则返回 false
@@ -1216,6 +1666,89 @@ ${contentToSend}
     ];
     
     return libraryPatterns.some(pattern => pattern.test(funcName));
+  };
+
+  const analyzeFunctionSingleLayer = async (
+    func: SubFunction,
+    parentFilePath: string,
+    flatTree: any[],
+    currentDepth: number
+  ): Promise<SubFunction[]> => {
+    addLog(`开始分析函数 ${func.name} 的一层子调用 (深度: ${currentDepth + 1})`, 'info');
+
+    if (isLibraryFunction(func.name)) {
+      addLog(`"${func.name}" 是系统或库函数，标记无需下钻分析`, 'info');
+      func.shouldDrillDown = -1;
+      return [];
+    }
+
+    const located = await locateFunctionInProject(
+      func.name,
+      func.possibleFile || parentFilePath,
+      owner,
+      repo,
+      defaultBranch,
+      flatTree,
+      getFileContentCached,
+      addLog
+    );
+
+    if (!located) {
+      addLog(`无法定位函数 ${func.name}，停止该节点下钻`, 'error');
+      return [];
+    }
+
+    const { code, filePath } = located;
+    const prompt = `请分析以下代码片段，识别其直接调用的关键子函数或方法（数量不超过15个），并以 JSON 数组格式返回。
+
+函数: ${func.name}
+文件: ${filePath}
+
+代码:
+${code}
+
+要求：
+1. 必须返回 JSON 数组格式
+2. 数组中每个对象必须包含 name、shouldDrillDown、possibleFile、description 四个字段
+3. 只返回 JSON，不要有其他文本
+
+请仅返回 JSON 数组，格式如下：
+[
+  {"name": "...", "shouldDrillDown": -1/0/1, "possibleFile": "...", "description": "..."}
+]`;
+
+    const rawResponse = await callAIAPI({
+      onUsage: trackAIUsage,
+      contents: prompt,
+      responseSchema: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            shouldDrillDown: { type: 'integer' },
+            possibleFile: { type: 'string' },
+            description: { type: 'string' },
+          },
+          required: ['name', 'shouldDrillDown', 'possibleFile', 'description'],
+        },
+      },
+    });
+
+    const nestedFunctions = safeJSONParse(rawResponse, `AI 子函数分析响应 (${func.name})`);
+    const validatedFunctions = nestedFunctions.map((f: SubFunction) => {
+      if (isLibraryFunction(f.name)) {
+        return { ...f, shouldDrillDown: -1 };
+      }
+      return f;
+    });
+
+    addLog(
+      `函数 ${func.name} 一层分析完成，识别出 ${validatedFunctions.length} 个子函数（库函数 ${validatedFunctions.filter((f: SubFunction) => f.shouldDrillDown === -1).length} 个）`,
+      'success'
+    );
+
+    return validatedFunctions.map((f: SubFunction) => ({ ...f, depth: currentDepth + 1 }));
   };
 
   /**
@@ -1375,12 +1908,57 @@ ${code}
   };
 
 
-  const analyzeSubFunctions = async (filePath: string, fileContent: string, description: string, flatTree: any[]) => {
+  const analyzeSubFunctions = async (
+    filePath: string,
+    fileContent: string,
+    description: string,
+    flatTree: any[],
+    mainLanguages: string[],
+    techStack: string[]
+  ) => {
     setAnalyzingFunctions(true);
     setWorkflowStatus('analyzing_calls');
     addLog(`开始分析入口文件调用的子函数: ${filePath}`, 'info');
 
     try {
+      const mainFunctionName = filePath.split('/').pop()?.split('.')[0] || 'main';
+      const bridgeResult = await tryResolveBridgeSubFunctions({
+        entryFilePath: filePath,
+        entryFileContent: fileContent,
+        flatTree,
+        mainLanguages,
+        techStack,
+        getFileContent: getFileContentCached,
+      });
+
+      if (bridgeResult) {
+        addLog(`桥接策略生效: ${bridgeResult.strategyName}，提取起始节点 ${bridgeResult.subFunctions.length} 个`, 'success', {
+          strategyId: bridgeResult.strategyId,
+          reason: bridgeResult.reason,
+          sample: bridgeResult.subFunctions.slice(0, 8),
+        });
+
+        const mainFunction: AnalyzedFunction = {
+          name: mainFunctionName,
+          file: filePath,
+          description: `项目主入口文件（通过 ${bridgeResult.strategyName} 桥接到框架层）`,
+          subFunctions: bridgeResult.subFunctions.map((f) => ({ ...f, depth: 0 })),
+        };
+
+        setAnalyzedFunctions([mainFunction]);
+        addLog(`开始从桥接节点递归分析函数调用链`, 'info');
+        mainFunction.subFunctions = await recursiveAnalyzeFunction(
+          mainFunction.subFunctions || [],
+          filePath,
+          flatTree,
+          0
+        );
+        setAnalyzedFunctions([mainFunction]);
+        addLog(`函数调用链分析完成`, 'success');
+        await analyzeFunctionModules([mainFunction], description, true);
+        return;
+      }
+
       const codeFiles = flatTree
         .filter(item => item.type === 'blob')
         .map(item => item.path)
@@ -1457,9 +2035,6 @@ ${fileContent}
         });
         
         addLog(`成功识别出 ${validatedSubFunctions.length} 个子函数，其中库函数 ${validatedSubFunctions.filter((f: SubFunction) => f.shouldDrillDown === -1).length} 个`, 'success', { response: validatedSubFunctions });
-        
-        // 从文件路径中提取主函数名（如 main.c -> main）
-        const mainFunctionName = filePath.split('/').pop()?.split('.')[0] || '主入口函数';
         
         const mainFunction: AnalyzedFunction = {
           name: mainFunctionName,
@@ -1685,6 +2260,80 @@ ${JSON.stringify(uniqueNodes, null, 2)}
       addLog(`定位函数源码失败: ${err.message}`, 'error');
     } finally {
       setFileLoading(false);
+    }
+  };
+
+  const handleManualDrillNode = async (payload: { nodeId: string; functionName: string; filePath: string; depth: number }) => {
+    if (payload.nodeId === 'root') {
+      return;
+    }
+
+    if (analyzedFunctions.length === 0) {
+      addLog('当前没有可下钻的调用链数据', 'error');
+      return;
+    }
+
+    const indexParts = payload.nodeId.replace(/^root-/, '').split('-').map((part) => Number(part));
+    if (indexParts.some((value) => Number.isNaN(value) || value < 0)) {
+      addLog(`无效的节点路径: ${payload.nodeId}`, 'error');
+      return;
+    }
+
+    const snapshot: AnalyzedFunction[] =
+      typeof structuredClone === 'function'
+        ? structuredClone(analyzedFunctions)
+        : JSON.parse(JSON.stringify(analyzedFunctions));
+
+    const root = snapshot[0];
+    if (!root) {
+      return;
+    }
+
+    let currentList = root.subFunctions || [];
+    let target: SubFunction | null = null;
+    for (const index of indexParts) {
+      target = currentList[index];
+      if (!target) {
+        addLog(`无法定位目标节点: ${payload.nodeId}`, 'error');
+        return;
+      }
+      currentList = target.subFunctions || [];
+    }
+
+    if (target.subFunctions && target.subFunctions.length > 0) {
+      addLog(`节点 ${target.name} 已存在子节点，跳过手动下钻`, 'info');
+      return;
+    }
+
+    if (target.shouldDrillDown < 0) {
+      addLog(`节点 ${target.name} 被标记为无需下钻`, 'info');
+      return;
+    }
+
+    const pseudoFlatTree = flatFileList.map((path) => ({ type: 'blob', path }));
+    setAnalyzingFunctions(true);
+    setWorkflowStatus('analyzing_calls');
+    addLog(`开始手动下钻节点: ${target.name}`, 'info');
+
+    try {
+      const nodeDepth = typeof target.depth === 'number' ? target.depth : Math.max(0, payload.depth);
+      const nextLayer = await analyzeFunctionSingleLayer(
+        target,
+        target.possibleFile || root.file,
+        pseudoFlatTree,
+        nodeDepth
+      );
+
+      target.subFunctions = nextLayer;
+      setAnalyzedFunctions(snapshot);
+      addLog(`手动下钻完成: ${target.name}，新增 ${nextLayer.length} 个子节点`, 'success');
+
+      await analyzeFunctionModules(snapshot, repoInfo?.description || '', true);
+    } catch (err: any) {
+      setWorkflowStatus('error');
+      addLog(`手动下钻失败: ${err.message}`, 'error');
+    } finally {
+      setAnalyzingFunctions(false);
     }
   };
 
@@ -2144,6 +2793,7 @@ ${JSON.stringify(uniqueNodes, null, 2)}
                     functionModules={functionModules}
                     activeModuleId={activeModuleId}
                     onNodeOpenSource={openFunctionSource}
+                    onManualDrillNode={handleManualDrillNode}
                   />
                 </div>
               </Panel>

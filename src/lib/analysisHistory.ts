@@ -12,6 +12,7 @@ export interface SubFunctionSnapshot {
   shouldDrillDown: number;
   possibleFile: string;
   description: string;
+  url?: string;
   depth?: number;
   moduleId?: string;
   moduleName?: string;
