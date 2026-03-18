@@ -1,3 +1,5 @@
+export type ProjectSourceKind = 'github' | 'local';
+
 export interface TreeNodeSnapshot {
   path: string;
   name: string;
@@ -65,6 +67,7 @@ export interface RepoInfoSnapshot {
 
 export interface ProjectAnalysisRecord {
   id: string;
+  sourceKind: ProjectSourceKind;
   owner: string;
   repo: string;
   projectName: string;
@@ -84,8 +87,11 @@ export interface ProjectAnalysisRecord {
 }
 
 export interface ProjectAnalysisDraft {
+  sourceKind: ProjectSourceKind;
   owner: string;
   repo: string;
+  projectName?: string;
+  projectUrl?: string;
   defaultBranch: string;
   repoInfo: RepoInfoSnapshot | null;
   aiAnalysis: AIAnalysisResultSnapshot | null;
@@ -102,7 +108,8 @@ const MAX_HISTORY_ITEMS = 20;
 
 const hasStorage = () => typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
 
-export const buildProjectUrl = (owner: string, repo: string) => `https://github.com/${owner}/${repo}`;
+export const buildProjectUrl = (owner: string, repo: string, sourceKind: ProjectSourceKind = 'github') =>
+  sourceKind === 'github' ? `https://github.com/${owner}/${repo}` : `local://${repo}`;
 
 const normalizeDetails = (details: unknown) => {
   if (details === undefined) {
@@ -141,6 +148,7 @@ export const buildAnalysisMarkdown = (record: Omit<ProjectAnalysisRecord, 'markd
 ## Project
 
 - Name: ${record.projectName}
+- Source: ${record.sourceKind}
 - URL: ${record.projectUrl}
 - Owner: ${record.owner}
 - Repository: ${record.repo}
@@ -217,15 +225,18 @@ export const upsertProjectHistory = (draft: ProjectAnalysisDraft) => {
   }
 
   const now = new Date().toISOString();
-  const projectUrl = buildProjectUrl(draft.owner, draft.repo);
+  const projectUrl = draft.projectUrl || buildProjectUrl(draft.owner, draft.repo, draft.sourceKind);
   const history = readProjectHistory();
-  const existing = history.find((item) => item.owner === draft.owner && item.repo === draft.repo);
+  const existing = history.find(
+    (item) => item.sourceKind === draft.sourceKind && item.owner === draft.owner && item.repo === draft.repo,
+  );
 
   const recordBase: Omit<ProjectAnalysisRecord, 'markdown'> = {
-    id: existing?.id || `${draft.owner}-${draft.repo}`,
+    id: existing?.id || `${draft.sourceKind}-${draft.owner}-${draft.repo}`,
+    sourceKind: draft.sourceKind,
     owner: draft.owner,
     repo: draft.repo,
-    projectName: draft.repoInfo?.name || draft.repo,
+    projectName: draft.projectName || draft.repoInfo?.name || draft.repo,
     projectUrl,
     createdAt: existing?.createdAt || now,
     updatedAt: now,

@@ -13,6 +13,7 @@ export default defineConfig(({mode}) => {
       'process.env.MODEL': JSON.stringify(env.MODEL),
       'process.env.GITHUB_TOKEN': JSON.stringify(env.GITHUB_TOKEN),
       'process.env.MAX_DRILL_DOWN_DEPTH': JSON.stringify(env.MAX_DRILL_DOWN_DEPTH || '2'),
+      'process.env.KEY_SUB_FUNCTION_LIMIT': JSON.stringify(env.KEY_SUB_FUNCTION_LIMIT || '10'),
     },
     resolve: {
       alias: {

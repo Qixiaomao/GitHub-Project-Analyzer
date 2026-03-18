@@ -20,9 +20,11 @@ import {
   FileText,
   Download,
   Layers3,
-  RefreshCw
+  RefreshCw,
+  Settings
 } from 'lucide-react';
 import PanoramaPanel from '../components/PanoramaPanel';
+import SettingsModal from '../components/SettingsModal';
 import {
   buildAnalysisMarkdown,
   getProjectHistoryRecord,
@@ -31,6 +33,22 @@ import {
   type ProjectAnalysisRecord,
   type FunctionModuleSnapshot,
 } from '../lib/analysisHistory';
+import {
+  buildTreeFromEntries,
+  createGitHubDataSource,
+  getRegisteredLocalDataSource,
+  type CodeDataSource,
+  type DataSourceFileEntry,
+  type DataSourceProjectInfo,
+} from '../lib/dataSources';
+import {
+  persistAppSettings,
+  readEnvSettings,
+  resolveAppSettings,
+  syncAppSettingsWithEnv,
+  type AppSettings,
+  type AppSettingsEnvValues,
+} from '../lib/appSettings';
 
 interface TreeNode {
   path: string;
@@ -75,6 +93,7 @@ interface BridgeContext {
   mainLanguages: string[];
   techStack: string[];
   getFileContent: (path: string) => Promise<string | null>;
+  searchFilesByContent: (query: string, candidatePaths?: string[]) => Promise<string[]>;
 }
 
 interface BridgeResult {
@@ -206,9 +225,10 @@ interface AIRequestConfig {
 }
 
 const callAIAPI = async (config: AIRequestConfig): Promise<string> => {
-  const baseUrl = process.env.BASE_URL;
-  const apiKey = process.env.API_KEY;
-  const model = process.env.MODEL;
+  const settings = resolveAppSettings();
+  const baseUrl = settings.baseUrl;
+  const apiKey = settings.apiKey;
+  const model = settings.model;
 
   if (!baseUrl || !apiKey) {
     throw new Error('BASE_URL 或 API_KEY 未在 .env 中配置');
@@ -243,14 +263,24 @@ const callAIAPI = async (config: AIRequestConfig): Promise<string> => {
   }
 
   // 发送请求到 API
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestBody)
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify(requestBody)
+    });
+  } catch (err: any) {
+    if (err instanceof TypeError) {
+      throw new Error(
+        `AI 接口网络请求失败，请检查 Base URL、网络连通性或跨域配置: ${baseUrl}/chat/completions`
+      );
+    }
+    throw err;
+  }
 
   if (!response.ok) {
     const error = await response.json();
@@ -484,11 +514,9 @@ const extractFunctionCode = (code: string, functionName: string, language: strin
 const locateFunctionInProject = async (
   functionName: string,
   preferredFile: string,
-  owner: string,
-  repo: string,
-  branch: string,
   flatTree: any[],
   getFileContent: (path: string) => Promise<string | null>,
+  searchFilesByContent: (query: string, candidatePaths?: string[]) => Promise<string[]>,
   addLog: (msg: string, type: 'info' | 'success' | 'error', details?: any) => void,
   onAIUsage?: (usage: { inputTokens: number; outputTokens: number; totalTokens: number }) => void
 ): Promise<{ filePath: string; code: string } | null> => {
@@ -538,7 +566,8 @@ ${codeFiles.join('\n')}
   }
 
   // 第三阶段：在所有代码文件中搜索
-  for (const file of codeFiles) {
+  const candidateFiles = await searchFilesByContent(functionName, codeFiles);
+  for (const file of (candidateFiles.length > 0 ? candidateFiles : codeFiles)) {
     try {
       const content = await getFileContent(file);
       if (content && extractFunctionCode(content, functionName, file)) {
@@ -1150,11 +1179,15 @@ const findFunctionLine = (code: string, functionName: string) => {
 export default function Analyze() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
+  const sourceKind = searchParams.get('source') === 'local' ? 'local' : 'github';
   const owner = searchParams.get('owner');
   const repo = searchParams.get('repo');
+  const localId = searchParams.get('localId');
   const historyId = searchParams.get('history');
 
-  const [urlInput, setUrlInput] = useState(`https://github.com/${owner}/${repo}`);
+  const [urlInput, setUrlInput] = useState(
+    sourceKind === 'github' && owner && repo ? `https://github.com/${owner}/${repo}` : '',
+  );
   const [tree, setTree] = useState<TreeNode[]>([]);
   const [flatFileList, setFlatFileList] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1165,6 +1198,7 @@ export default function Analyze() {
   const [targetFunctionLine, setTargetFunctionLine] = useState<number | null>(null);
   const [defaultBranch, setDefaultBranch] = useState('main');
   const [repoInfo, setRepoInfo] = useState<RepoInfo | null>(null);
+  const [projectInfo, setProjectInfo] = useState<DataSourceProjectInfo | null>(null);
 
   const [aiAnalysis, setAiAnalysis] = useState<AIAnalysisResult | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
@@ -1183,13 +1217,20 @@ export default function Analyze() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isLogFullscreen, setIsLogFullscreen] = useState(false);
   const [isMarkdownPreviewOpen, setIsMarkdownPreviewOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [aiStats, setAiStats] = useState<AIStats>({ callCount: 0, inputTokens: 0, outputTokens: 0 });
+  const [appSettings, setAppSettings] = useState<AppSettings>(() => syncAppSettingsWithEnv());
+  const [envSettings, setEnvSettings] = useState<AppSettingsEnvValues>(() => readEnvSettings());
 
   const functionAnalysisCacheRef = useRef<Map<string, SubFunction[]>>(new Map());
+  const dataSourceRef = useRef<CodeDataSource | null>(null);
 
   const [showFileTree, setShowFileTree] = useState(true);
   const [showCodeViewer, setShowCodeViewer] = useState(true);
   const [showPanorama, setShowPanorama] = useState(true);
+
+  const maxDrillDownDepth = appSettings.maxDrillDownDepth || 2;
+  const keySubFunctionLimit = appSettings.keySubFunctionLimit || 10;
 
   const addLog = (message: string, type: 'info' | 'success' | 'error' = 'info', details?: any) => {
     setLogs(prev => [...prev, {
@@ -1209,12 +1250,33 @@ export default function Analyze() {
     }));
   };
 
+  const handleSaveSettings = (nextSettings: AppSettings) => {
+    const persisted = persistAppSettings(nextSettings);
+    setAppSettings(resolveAppSettings());
+    setEnvSettings(readEnvSettings());
+    setIsSettingsOpen(false);
+    addLog('设置已保存，环境变量项仍会保持优先级', 'success', { settings: persisted });
+  };
+
   const restoreFromHistory = (record: ProjectAnalysisRecord) => {
     setUrlInput(record.projectUrl);
     setTree(record.fileTree);
     setFlatFileList(record.flatFileList);
     setDefaultBranch(record.defaultBranch || 'main');
     setRepoInfo(record.repoInfo as RepoInfoSnapshot | null);
+    setProjectInfo(
+      record.repoInfo
+        ? {
+            ...record.repoInfo,
+            sourceKind: record.sourceKind || 'github',
+            projectUrl: record.projectUrl,
+            owner: record.sourceKind === 'github' ? record.owner : undefined,
+            repo: record.sourceKind === 'github' ? record.repo : undefined,
+            locationLabel:
+              record.sourceKind === 'local' ? record.projectName : `${record.owner}/${record.repo}`,
+          }
+        : null,
+    );
     setAiAnalysis(record.aiAnalysis);
     setConfirmedEntryFile(record.confirmedEntryFile);
     setFunctionModules(record.functionModules || []);
@@ -1236,16 +1298,20 @@ export default function Analyze() {
   };
 
   const getCurrentAnalysisMarkdown = () => {
-    if (!owner || !repo) {
+    const markdownOwner = owner || sourceKind;
+    const markdownRepo = repo || projectInfo?.name || 'local-project';
+
+    if (!markdownRepo) {
       return '';
     }
 
     return buildAnalysisMarkdown({
-      id: `${owner}-${repo}`,
-      owner,
-      repo,
-      projectName: repoInfo?.name || repo,
-      projectUrl: `https://github.com/${owner}/${repo}`,
+      id: `${markdownOwner}-${markdownRepo}`,
+      sourceKind,
+      owner: markdownOwner,
+      repo: markdownRepo,
+      projectName: repoInfo?.name || markdownRepo,
+      projectUrl: projectInfo?.projectUrl || urlInput || markdownRepo,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       defaultBranch,
@@ -1262,7 +1328,8 @@ export default function Analyze() {
 
   const handleExportMarkdown = () => {
     const markdown = getCurrentAnalysisMarkdown();
-    if (!markdown || !owner || !repo) {
+    const exportName = repo || projectInfo?.name || 'analysis';
+    if (!markdown) {
       return;
     }
 
@@ -1270,12 +1337,17 @@ export default function Analyze() {
     const downloadUrl = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = downloadUrl;
-    link.download = `${owner}-${repo}-analysis.md`;
+    link.download = `${exportName}-analysis.md`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(downloadUrl);
   };
+
+  useEffect(() => {
+    setAppSettings(syncAppSettingsWithEnv());
+    setEnvSettings(readEnvSettings());
+  }, []);
 
   useEffect(() => {
     if (historyId) {
@@ -1289,14 +1361,30 @@ export default function Analyze() {
       return;
     }
 
-    if (owner && repo) {
-      fetchRepoData(owner, repo);
-    } else {
-      navigate('/');
+    if (sourceKind === 'github' && owner && repo) {
+      const source = createGitHubDataSource(owner, repo);
+      dataSourceRef.current = source;
+      fetchProjectData(source);
+      return;
     }
-  }, [historyId, owner, repo]);
 
-  const fetchRepoData = async (owner: string, repo: string) => {
+    if (sourceKind === 'local' && localId) {
+      const source = getRegisteredLocalDataSource(localId);
+      if (!source) {
+        setError('当前本地目录会话已失效，请返回首页重新选择目录。');
+        setLoading(false);
+        return;
+      }
+
+      dataSourceRef.current = source;
+      fetchProjectData(source);
+      return;
+    }
+
+    navigate('/');
+  }, [historyId, localId, navigate, owner, repo, sourceKind]);
+
+  const fetchProjectData = async (dataSource: CodeDataSource) => {
     setLoading(true);
     setError('');
     setTree([]);
@@ -1307,6 +1395,7 @@ export default function Analyze() {
     setAiStats({ callCount: 0, inputTokens: 0, outputTokens: 0 });
     functionAnalysisCacheRef.current.clear();
     setRepoInfo(null);
+    setProjectInfo(null);
     setAiAnalysis(null);
     setConfirmedEntryFile(null);
     setFunctionModules([]);
@@ -1314,85 +1403,34 @@ export default function Analyze() {
     setAnalyzedFunctions([]);
     setWorkflowStatus('fetching_repo');
 
-    addLog(`开始校验 GitHub 项目地址: ${owner}/${repo}`, 'info');
-
     try {
-      // 1. 获取仓库信息，主要是为了获取默认分支
-      const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
-        headers: buildGitHubHeaders()
-      });
-      if (!repoRes.ok) {
-        if (repoRes.status === 404) throw new Error('仓库不存在或为私有仓库');
-        if (repoRes.status === 403) throw new Error('API 请求频率超限，请稍后再试');
-        throw new Error('获取仓库信息失败');
-      }
-      const repoData = await repoRes.json();
-      const branch = repoData.default_branch;
-      const description = repoData.description || '';
+      addLog(`开始加载${dataSource.kind === 'github' ? ' GitHub ' : '本地'}项目数据`, 'info');
+      const sourceProjectInfo = await dataSource.getProjectInfo();
+      const branch = sourceProjectInfo.defaultBranch || 'local';
+      const description = sourceProjectInfo.description || '';
+      const fileEntries = await dataSource.listFiles();
+
+      setProjectInfo(sourceProjectInfo);
       setDefaultBranch(branch);
       setRepoInfo({
-        name: repoData.name,
-        fullName: repoData.full_name,
+        name: sourceProjectInfo.name,
+        fullName: sourceProjectInfo.fullName,
         description,
-        htmlUrl: repoData.html_url,
+        htmlUrl: sourceProjectInfo.projectUrl,
         defaultBranch: branch,
-        language: repoData.language,
-        stargazersCount: repoData.stargazers_count,
-        forksCount: repoData.forks_count,
-        openIssuesCount: repoData.open_issues_count,
-        updatedAt: repoData.updated_at,
+        language: sourceProjectInfo.language,
+        stargazersCount: sourceProjectInfo.stargazersCount,
+        forksCount: sourceProjectInfo.forksCount,
+        openIssuesCount: sourceProjectInfo.openIssuesCount,
+        updatedAt: sourceProjectInfo.updatedAt,
       });
-      addLog(`校验通过，获取到默认分支: ${branch}`, 'success');
+      setUrlInput(sourceProjectInfo.projectUrl);
+      setFlatFileList(fileEntries.map((item) => item.path));
+      setTree(buildTreeFromEntries(fileEntries) as TreeNode[]);
+      addLog(`项目信息加载完成: ${sourceProjectInfo.locationLabel || sourceProjectInfo.name}`, 'success');
+      addLog(`成功获取项目文件列表，共 ${fileEntries.length} 个节点`, 'success');
 
-      // 2. 获取整个文件树
-      addLog('正在获取项目文件列表...', 'info');
-      const treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
-        headers: buildGitHubHeaders()
-      });
-      if (!treeRes.ok) throw new Error('获取文件树失败');
-      
-      const treeData = await treeRes.json();
-      setFlatFileList(treeData.tree.map((item: any) => item.path));
-      addLog(`成功获取项目文件列表，共 ${treeData.tree.length} 个文件/目录`, 'success');
-      
-      // 3. 构建树形结构
-      const root: TreeNode[] = [];
-      const map: Record<string, TreeNode> = {};
-
-      // 排序：文件夹在前，文件在后
-      const sortedTree = treeData.tree.sort((a: any, b: any) => {
-        if (a.type === b.type) return a.path.localeCompare(b.path);
-        return a.type === 'tree' ? -1 : 1;
-      });
-
-      sortedTree.forEach((item: any) => {
-        const parts = item.path.split('/');
-        const name = parts[parts.length - 1];
-        const node: TreeNode = {
-          path: item.path,
-          name,
-          type: item.type,
-          url: item.url,
-          children: item.type === 'tree' ? [] : undefined,
-          isOpen: false,
-        };
-
-        map[item.path] = node;
-
-        if (parts.length === 1) {
-          root.push(node);
-        } else {
-          const parentPath = parts.slice(0, -1).join('/');
-          if (map[parentPath] && map[parentPath].children) {
-            map[parentPath].children!.push(node);
-          }
-        }
-      });
-
-      setTree(root);
-      
-      // 触发 AI 分析
-      analyzeWithAI(treeData.tree, description, branch);
+      analyzeWithAI(fileEntries, description, branch);
     } catch (err: any) {
       setWorkflowStatus('error');
       setError(err.message || '发生未知错误');
@@ -1403,17 +1441,19 @@ export default function Analyze() {
   };
 
   useEffect(() => {
-    if (!owner || !repo) {
+    if (loading || !projectInfo) {
       return;
     }
 
-    if (loading) {
-      return;
-    }
+    const historyOwner = sourceKind === 'github' ? owner || 'unknown-owner' : 'local';
+    const historyRepo = sourceKind === 'github' ? repo || projectInfo.name : projectInfo.name;
 
     upsertProjectHistory({
-      owner,
-      repo,
+      sourceKind,
+      owner: historyOwner,
+      repo: historyRepo,
+      projectName: projectInfo.name,
+      projectUrl: projectInfo.projectUrl,
       defaultBranch,
       repoInfo,
       aiAnalysis,
@@ -1425,8 +1465,10 @@ export default function Analyze() {
       logs: serializeLogs(logs),
     });
   }, [
+    sourceKind,
     owner,
     repo,
+    projectInfo,
     loading,
     defaultBranch,
     repoInfo,
@@ -1526,14 +1568,11 @@ export default function Analyze() {
     for (const filePath of entryFiles) {
       addLog(`开始研判文件是否为真实入口: ${filePath}`, 'info');
       try {
-        const res = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${encodeURI(filePath)}`, {
-          headers: buildRawGitHubHeaders()
-        });
-        if (!res.ok) {
+        const text = await getFileContentCached(filePath);
+        if (!text) {
           addLog(`无法获取文件内容: ${filePath}`, 'error');
           continue;
         }
-        const text = await res.text();
         const lines = text.split('\n');
         let contentToSend = text;
         if (lines.length > 4000) {
@@ -1610,13 +1649,17 @@ ${contentToSend}
    */
   const getFileContentCached = async (filePath: string): Promise<string | null> => {
     try {
-      const res = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${encodeURI(filePath)}`, {
-        headers: buildRawGitHubHeaders()
-      });
-      if (!res.ok) return null;
-      return await res.text();
-    } catch (err) {
+      return await dataSourceRef.current?.readFile(filePath)!;
+    } catch {
       return null;
+    }
+  };
+
+  const searchFilesByContentCached = async (query: string, candidatePaths?: string[]): Promise<string[]> => {
+    try {
+      return (await dataSourceRef.current?.searchFilesByContent(query, candidatePaths)) || [];
+    } catch {
+      return [];
     }
   };
 
@@ -1685,11 +1728,9 @@ ${contentToSend}
     const located = await locateFunctionInProject(
       func.name,
       func.possibleFile || parentFilePath,
-      owner,
-      repo,
-      defaultBranch,
       flatTree,
       getFileContentCached,
+      searchFilesByContentCached,
       addLog
     );
 
@@ -1699,7 +1740,7 @@ ${contentToSend}
     }
 
     const { code, filePath } = located;
-    const prompt = `请分析以下代码片段，识别其直接调用的关键子函数或方法（数量不超过15个），并以 JSON 数组格式返回。
+    const prompt = `请分析以下代码片段，识别其直接调用的关键子函数或方法（数量不超过${keySubFunctionLimit}个），并以 JSON 数组格式返回。
 
 函数: ${func.name}
 文件: ${filePath}
@@ -1760,7 +1801,7 @@ ${code}
     flatTree: any[],
     currentDepth: number = 0
   ): Promise<SubFunction[]> => {
-    const maxDepth = parseInt(process.env.MAX_DRILL_DOWN_DEPTH || '2');
+    const maxDepth = maxDrillDownDepth;
     
     if (currentDepth >= maxDepth) {
       addLog(`已达到最大递归深度 (${maxDepth})`, 'info');
@@ -1785,11 +1826,9 @@ ${code}
           const located = await locateFunctionInProject(
             func.name,
             func.possibleFile || parentFilePath,
-            owner,
-            repo,
-            defaultBranch,
             flatTree,
             getFileContentCached,
+            searchFilesByContentCached,
             addLog
           );
 
@@ -1809,7 +1848,7 @@ ${code}
           }
 
           // 让AI分析该函数的子函数
-          const prompt = `请分析以下代码片段，识别其调用的关键子函数或方法（数量不超过15个），并以 JSON 数组格式返回。
+          const prompt = `请分析以下代码片段，识别其调用的关键子函数或方法（数量不超过${keySubFunctionLimit}个），并以 JSON 数组格式返回。
 
 函数: ${func.name}
 文件: ${filePath}
@@ -1929,6 +1968,7 @@ ${code}
         mainLanguages,
         techStack,
         getFileContent: getFileContentCached,
+        searchFilesByContent: searchFilesByContentCached,
       });
 
       if (bridgeResult) {
@@ -2194,20 +2234,15 @@ ${JSON.stringify(uniqueNodes, null, 2)}
 
   const fetchFileContent = async (node: TreeNode) => {
     if (node.type !== 'blob') return;
-    
+
     setSelectedFile(node);
     setFileLoading(true);
     setFileContent('');
     setTargetFunctionLine(null);
 
     try {
-      // 使用 raw.githubusercontent.com 获取原始文件内容
-      const res = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${encodeURI(node.path)}`, {
-        headers: buildRawGitHubHeaders()
-      });
-      if (!res.ok) throw new Error('获取文件内容失败');
-      
-      const text = await res.text();
+      const text = await getFileContentCached(node.path);
+      if (!text) throw new Error('无法获取文件内容');
       setFileContent(text);
     } catch (err: any) {
       setFileContent(`// 错误: ${err.message}`);
@@ -2245,11 +2280,8 @@ ${JSON.stringify(uniqueNodes, null, 2)}
     setFileContent('');
 
     try {
-      const res = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${encodeURI(filePath)}`, {
-        headers: buildRawGitHubHeaders()
-      });
-      if (!res.ok) throw new Error('无法获取函数所在文件内容');
-      const text = await res.text();
+      const text = await getFileContentCached(filePath);
+      if (!text) throw new Error('无法获取函数所在文件内容');
       setFileContent(text);
       const line = findFunctionLine(text, functionName);
       setTargetFunctionLine(line);
@@ -2440,6 +2472,14 @@ ${JSON.stringify(uniqueNodes, null, 2)}
         
         {/* Panel Toggles */}
         <div className="flex items-center space-x-2">
+          <button
+            type="button"
+            onClick={() => setIsSettingsOpen(true)}
+            className="inline-flex items-center rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-50"
+          >
+            <Settings className="mr-1.5 h-3.5 w-3.5" />
+            设置
+          </button>
           <button 
             onClick={() => setShowFileTree(!showFileTree)}
             className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${showFileTree ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
@@ -2499,6 +2539,20 @@ ${JSON.stringify(uniqueNodes, null, 2)}
                   >
                     <Maximize2 className="w-3.5 h-3.5" />
                   </button>
+                </div>
+                <div className="mb-3 grid grid-cols-3 gap-2">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">AI 调用次数</div>
+                    <div className="mt-1 text-sm font-semibold text-slate-900">{aiStats.callCount}</div>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">输入 Tokens</div>
+                    <div className="mt-1 text-sm font-semibold text-slate-900">{aiStats.inputTokens}</div>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">输出 Tokens</div>
+                    <div className="mt-1 text-sm font-semibold text-slate-900">{aiStats.outputTokens}</div>
+                  </div>
                 </div>
                 <div className="space-y-2 max-h-48 overflow-y-auto custom-scrollbar pr-1">
                   {logs.length === 0 ? (
@@ -2802,6 +2856,14 @@ ${JSON.stringify(uniqueNodes, null, 2)}
         </Group>
       </div>
 
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        settings={appSettings}
+        envSettings={envSettings}
+        onClose={() => setIsSettingsOpen(false)}
+        onSave={handleSaveSettings}
+      />
+
       {/* Fullscreen Log Modal */}
       {isLogFullscreen && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6 md:p-12">
@@ -2816,6 +2878,20 @@ ${JSON.stringify(uniqueNodes, null, 2)}
               >
                 <X className="w-5 h-5" />
               </button>
+            </div>
+            <div className="grid grid-cols-3 gap-3 border-b border-slate-200 bg-white px-6 py-4">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                <div className="text-[10px] uppercase tracking-wider text-slate-500">AI 调用次数</div>
+                <div className="mt-1 text-sm font-semibold text-slate-900">{aiStats.callCount}</div>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                <div className="text-[10px] uppercase tracking-wider text-slate-500">输入 Tokens</div>
+                <div className="mt-1 text-sm font-semibold text-slate-900">{aiStats.inputTokens}</div>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                <div className="text-[10px] uppercase tracking-wider text-slate-500">输出 Tokens</div>
+                <div className="mt-1 text-sm font-semibold text-slate-900">{aiStats.outputTokens}</div>
+              </div>
             </div>
             <div className="flex-1 overflow-y-auto p-6 bg-slate-50/50 custom-scrollbar space-y-3">
               {logs.length === 0 ? (

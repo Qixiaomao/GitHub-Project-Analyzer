@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Background,
   Controls,
@@ -9,6 +9,7 @@ import {
   useEdgesState,
   useNodesState,
 } from '@xyflow/react';
+import { Download } from 'lucide-react';
 import '@xyflow/react/dist/style.css';
 
 interface SubFunction {
@@ -152,6 +153,38 @@ const nodeTypes = {
 
 const getNodeId = (parentPath: string, index: number) => (parentPath ? `${parentPath}-${index}` : `root-${index}`);
 
+const copyComputedStyles = (source: HTMLElement, target: HTMLElement) => {
+  const computed = window.getComputedStyle(source);
+  Array.from(computed).forEach((property) => {
+    target.style.setProperty(
+      property,
+      computed.getPropertyValue(property),
+      computed.getPropertyPriority(property),
+    );
+  });
+};
+
+const cloneWithInlineStyles = (node: HTMLElement): HTMLElement => {
+  const clone = node.cloneNode(false) as HTMLElement;
+  copyComputedStyles(node, clone);
+
+  Array.from(node.childNodes).forEach((child) => {
+    if (child.nodeType === Node.TEXT_NODE) {
+      clone.appendChild(child.cloneNode(true));
+      return;
+    }
+
+    if (child instanceof HTMLElement) {
+      clone.appendChild(cloneWithInlineStyles(child));
+      return;
+    }
+
+    clone.appendChild(child.cloneNode(true));
+  });
+
+  return clone;
+};
+
 export default function PanoramaPanel({
   analyzedFunctions,
   functionModules,
@@ -159,6 +192,8 @@ export default function PanoramaPanel({
   onNodeOpenSource,
   onManualDrillNode,
 }: PanoramaPanelProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
   const moduleMap = useMemo(() => {
     const map = new Map<string, FunctionModule>();
     functionModules.forEach((module) => map.set(module.id, module));
@@ -383,9 +418,77 @@ export default function PanoramaPanel({
     );
   }
 
+  const handleExportImage = async () => {
+    const flowElement = containerRef.current?.querySelector('.react-flow') as HTMLElement | null;
+    if (!flowElement) {
+      return;
+    }
+
+    try {
+      setIsExporting(true);
+
+      const width = flowElement.clientWidth;
+      const height = flowElement.clientHeight;
+      const clonedFlow = cloneWithInlineStyles(flowElement);
+      clonedFlow.querySelectorAll('.react-flow__controls, .react-flow__attribution').forEach((element) => element.remove());
+
+      const serialized = new XMLSerializer().serializeToString(clonedFlow);
+      const svg = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+          <foreignObject width="100%" height="100%">${serialized}</foreignObject>
+        </svg>
+      `;
+
+      const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const image = new Image();
+
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error('导出图片失败'));
+        image.src = url;
+      });
+
+      const canvas = document.createElement('canvas');
+      const scale = window.devicePixelRatio > 1 ? 2 : 1;
+      canvas.width = width * scale;
+      canvas.height = height * scale;
+
+      const context = canvas.getContext('2d');
+      if (!context) {
+        throw new Error('浏览器不支持图片导出');
+      }
+
+      context.scale(scale, scale);
+      context.fillStyle = '#f8fafc';
+      context.fillRect(0, 0, width, height);
+      context.drawImage(image, 0, 0, width, height);
+      URL.revokeObjectURL(url);
+
+      const downloadUrl = canvas.toDataURL('image/png');
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = `panorama-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+      link.click();
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   return (
-    <div className="w-full h-full bg-slate-50 relative">
+    <div ref={containerRef} className="w-full h-full bg-slate-50 relative">
       <div className="absolute right-3 top-3 z-20 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={handleExportImage}
+          disabled={isExporting}
+          className="inline-flex items-center rounded border border-slate-300 bg-white px-2.5 py-1 text-xs text-slate-700 shadow hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          <Download className="mr-1 h-3.5 w-3.5" />
+          {isExporting ? '导出中...' : '导出图片'}
+        </button>
         <button
           type="button"
           onClick={() => {
